@@ -23,6 +23,10 @@
 /* The biggest message we're willing to receive */
 #define MAX_MESSAGE_SIZE 1000
 
+#define DEBUG_TRACE	(1<<0)
+#define DEBUG_STATUS	(1<<1)
+#define DEBUG_CHATTY	(1<<2)
+
 static long max_entries = 25;	/* Maximum number of entries we'll	*/
 				/* handle at one time */
 static long queue_head[2];	/* Queue header */
@@ -30,6 +34,10 @@ static long queue_count;	/* Number of entries in the queue */
 static long accepting_connections = 0;	/* True if we're accepting	*/
 					/* connections, otherwise false */
 static long ServiceInUse = 0;	/* Have we actually started? */
+
+static long DebugLevel = 0;     /* Because things inevitably go wrong, */
+				/* and it's nice to be able to follow */
+				/* along at home */
 
 struct queue_entry {
 	char private_to_queue[8];
@@ -45,6 +53,10 @@ void connect_call(unsigned int event_type, unsigned int conn_handle,
   struct queue_entry *queue_entry;
   int status;
   
+  if (DebugLevel & DEBUG_TRACE) {
+    puts("Entering connect_call");
+  }
+
   /* Are we accepting any new connections? */
   if ((queue_count > max_entries) || !accepting_connections) {
     /* Nope. Tell 'em to go away */
@@ -53,23 +65,36 @@ void connect_call(unsigned int event_type, unsigned int conn_handle,
     /* Yep. Increment the connect count and aquire the		*/
     /* connection */
     status = sys$icc_accept(conn_handle, NULL, 0, 0, 0);
+
+    if (DebugLevel & DEBUG_STATUS) {
+      printf("sys$icc_accept returned %i\n", status);
+    }
+
     if (status == SS$_NORMAL) {
       /* Take the accepted connection, make a note of it, build a */
       /* queue entry, and put it on the queue */
 
       /* Gotta be atomic, otherwise it's not threadsafe. (Or AST safe, */
       /* for that matter) */
-      __ATOMIC_INCREMENT_LONG(&queue_count);
       queue_entry = malloc(sizeof(queue_entry));
       queue_entry->conn_handle = conn_handle;
       lib$insqti(queue_entry, queue_head);
+      __ATOMIC_INCREMENT_LONG(&queue_count);
+      if (DebugLevel & DEBUG_CHATTY) {
+	printf("Accepted connection handle %i\n", conn_handle);
+      }
     }
+  }
+
+  if (DebugLevel & DEBUG_TRACE) {
+    puts("Leaving connect_call");
   }
   return;
 }
 
 char * ss_translate(int status)
 {
+  
   switch(status) {
   case SS$_NORMAL: return "SS$_NORMAL";
   case SS$_ACCVIO: return "SS$_ACCVIO";
@@ -84,6 +109,8 @@ char * ss_translate(int status)
   case SS$_NOPRIV: return "SS$_NOPRIV";
   case SS$_SSFAIL: return "SS$_SSFAIL";
   case SS$_TOO_MANY_ARGS: return "SS$_TOO_MANY_ARGS";
+  case SS$_NOLOGTAB: return "SS$_NOLOGTAB";
+  case SS$_NOSUCHOBJ: return "SS$_NOSUCHOBJ";
   default: return "dunno";
   }
 }
@@ -93,6 +120,16 @@ MODULE = VMS::ICC		PACKAGE = VMS::ICC
 BOOT:
 queue_count = 0;
 Zero(queue_head, 2, long);
+
+
+int
+debug(debug_level)
+    int debug_level;
+   CODE:
+     RETVAL = DebugLevel;
+     DebugLevel = debug_level;
+   OUTPUT:
+     RETVAL
 
 
 SV *
@@ -108,11 +145,15 @@ new_service(service_name = &PL_sv_undef, logical_name = &PL_sv_undef, logical_ta
   struct dsc$descriptor LogicalName;
   struct dsc$descriptor ServiceName;
 
-  $DESCRIPTOR(DefaultLogTable, "ICC$REGUSTRY_TABLE");
+  $DESCRIPTOR(DefaultLogTable, "ICC$REGISTRY_TABLE");
 
   struct dsc$descriptor *LogicalTablePtr, *LogicalNamePtr, *ServiceNamePtr;
 
   unsigned int AssocHandle, status;
+
+  if (DebugLevel & DEBUG_TRACE) {
+    puts("Entering new_service");
+  }
 
   /* Three parameters. service_name can be undef, in which case we'll   
      use the default service name. If logical_table is undef, then we'll   
@@ -170,16 +211,28 @@ new_service(service_name = &PL_sv_undef, logical_name = &PL_sv_undef, logical_ta
 			      LogicalTablePtr, connect_call, NULL, NULL,
 			      0, 0);
 
+  if (DebugLevel & DEBUG_STATUS) {
+    printf("sys$icc_open_assoc returned %i\n", status);
+  }
   /* Did it work? */
   if ($VMS_STATUS_SUCCESS(status)) {
     accepting_connections = 1;
     ServiceInUse = 1;
     XPUSHs(sv_2mortal(newSViv(AssocHandle)));
+    if (DebugLevel & DEBUG_TRACE) {
+      puts("Leaving new_service");
+    }
     XSRETURN(1);
   } else {
-    printf("Error %s\n", ss_translate(status));
+    printf("Error %i/%s\n", status, ss_translate(status));
     SETERRNO(EVMSERR, status);
+    if (DebugLevel & DEBUG_TRACE) {
+      puts("Leaving new_service");
+    }
     XSRETURN_UNDEF;
+  }
+  if (DebugLevel & DEBUG_TRACE) {
+    puts("Leaving new_service");
   }
 }
 
@@ -195,6 +248,11 @@ accept_connection(service_handle = &PL_sv_undef)
 
   SV *return_sv;
   struct queue_entry *queue_entry;
+
+  if (DebugLevel & DEBUG_TRACE) {
+    puts("Entering accept_connection");
+  }
+
   /* try and take an entry off the queue and see what happens */
   lib$remqhi(queue_head, &queue_entry);
   /* If we got back the address of the queue_head, then there wasn't */
@@ -202,6 +260,9 @@ accept_connection(service_handle = &PL_sv_undef)
   /* Yeah, I know casting these both to longs is skanky. But it shuts */
   /* the compiler up */
   if ((long)queue_entry == (long)queue_head) {
+    if (DebugLevel & DEBUG_TRACE) {
+      puts("Leaving accept_connection emptyhanded");
+    }
     XSRETURN_UNDEF;
   }
 
@@ -211,11 +272,20 @@ accept_connection(service_handle = &PL_sv_undef)
   /* Hey, look--we got something. Pass it back. This counts on the */
   /* fact that a pointer will fit into the IV slot of an SV. This is */
   /* probably a bad, bad thing I'm doing here... */
-  XPUSHs(sv_2mortal(newSViv(queue_entry->conn_handle)));
+  return_sv = sv_2mortal(newSViv(queue_entry->conn_handle));
+  XPUSHs(return_sv);
+
+  if (DebugLevel & DEBUG_CHATTY) {
+    printf("Fetched connect handle %i (%i)\n",
+	   queue_entry->conn_handle, SvIV(return_sv));
+  }
 
   /* Free up the queue entry */
   Safefree(queue_entry);
 
+  if (DebugLevel & DEBUG_TRACE) {
+    puts("Leaving accept_connection");
+  }
   XSRETURN(1);
 }
 
@@ -228,25 +298,46 @@ read_data(connection_handle)
   int status;
   ios_icc ICC_Info;
 
+  if (DebugLevel & DEBUG_TRACE) {
+    puts("Entering read_data");
+  }
+
   /* Create us a new SV with MAX_MESSAGE_SIZE bytes allocated. Mark it */
   /* as mortal, too */
   received_data = NEWSV(912, MAX_MESSAGE_SIZE);
   sv_2mortal(received_data);
 
+  if (DebugLevel & DEBUG_CHATTY) {
+    printf("Listening on handle %i\n", SvIV(connection_handle));
+  }
+
   /* Go look for some data */
   status = sys$icc_receivew(SvIV(connection_handle), &ICC_Info, NULL, 0,
 			    SvPVX(received_data), MAX_MESSAGE_SIZE);
+
+  if (DebugLevel & DEBUG_STATUS) {
+    printf("sys$icc_receivew returned %i\n", status);
+  }
   /* Did it go OK? */
   if (SS$_NORMAL == status) {
     /* Set the scalar length */
     SvCUR(received_data) = ICC_Info.ios_icc$l_rcv_len;
     SvPOK_on(received_data);
     XPUSHs(received_data);
+    if (DebugLevel & DEBUG_TRACE) {
+      puts("Leaving read_data");
+    }
     XSRETURN(1);
   } else {
     /* Guess something went wrong. Return the status */
     SETERRNO(EVMSERR, status);
+    if (DebugLevel & DEBUG_TRACE) {
+      puts("Leaving read_data");
+    }
     XSRETURN_UNDEF;
+  }
+  if (DebugLevel & DEBUG_TRACE) {
+    puts("Leaving read_data");
   }
 }
 
@@ -259,25 +350,52 @@ write_data(connection_handle, data, async = &PL_sv_undef)
 {
   ios_icc ICC_Info;
   int status;
+
+  if (DebugLevel & DEBUG_TRACE) {
+    puts("Entering write_data");
+  }
   /* Just return with ACCVIO they gave us no data. That's what'd */
   /* happen, after all, if we tried passing a null buffer around */
   if (!SvCUR(data)) {
     SETERRNO(EVMSERR, SS$_ACCVIO);
+    if (DebugLevel & DEBUG_TRACE) {
+      puts("Leaving write_data");
+    }
     XSRETURN_UNDEF;
+  }
+
+  if (DebugLevel & DEBUG_CHATTY) {
+    printf("Sending %i bytes to handle %i\n", SvCUR(data),
+	   SvIV(connection_handle));
   }
 
   if (SvTRUE(async)) {
     status = sys$icc_transmit(SvIV(connection_handle), &ICC_Info, NULL, NULL,
 			      SvPVX(data), SvCUR(data));
+    if (DebugLevel & DEBUG_STATUS) {
+      printf("sys$icc_transmit returned %i\n", status);
+    }
   } else {
     status = sys$icc_transmitw(SvIV(connection_handle), &ICC_Info, NULL, NULL,
 			       SvPVX(data), SvCUR(data));
+    if (DebugLevel & DEBUG_STATUS) {
+      printf("sys$icc_transmitw returned %i\n", status);
+    }
   }
   if (SS$_NORMAL == status) {
+    if (DebugLevel & DEBUG_TRACE) {
+      puts("Leaving write_data");
+    }
     XSRETURN_YES;
   } else {
     SETERRNO(EVMSERR, status);
+    if (DebugLevel & DEBUG_TRACE) {
+      puts("Leaving write_data");
+    }
     XSRETURN_UNDEF;
+  }
+  if (DebugLevel & DEBUG_TRACE) {
+    puts("Leaving write_data");
   }
 }
 
@@ -288,11 +406,24 @@ close_connection(connection_handle)
 {
   int status;
   iosb iosb;
+
+  if (DebugLevel & DEBUG_TRACE) {
+    puts("Entering close_connection");
+  }
   status = sys$icc_disconnectw(SvIV(connection_handle), &iosb,0,0,0,0);
+  if (DebugLevel & DEBUG_STATUS) {
+    printf("sys$icc_disconnectw returned %i\n", status);
+  }
   if (SS$_NORMAL == status) {
+    if (DebugLevel & DEBUG_TRACE) {
+      puts("Leaving close_connection");
+    }
     XSRETURN_YES;
   } else {
     SETERRNO(EVMSERR, status);
+    if (DebugLevel & DEBUG_TRACE) {
+      puts("Leaving close_connection");
+    }
     XSRETURN_UNDEF;
   }
 }
@@ -305,6 +436,9 @@ delete_service(service_handle=&PL_sv_undef)
   struct queue_entry *queue_entry;
   iosb iosb;
 
+  if (DebugLevel & 255) {
+    puts("Entering delete_service");
+  }
   /* Close the association */
   sys$icc_close_assoc(SvIV(service_handle));
 
@@ -324,6 +458,9 @@ delete_service(service_handle=&PL_sv_undef)
   /* Mark the service as not in use */
   ServiceInUse = 0;
 
+  if (DebugLevel & 255) {
+    puts("Leaving delete_service");
+  }
   /* return OK */
   XSRETURN_YES;
 }
@@ -337,13 +474,21 @@ open_connection(assoc_name, node = &PL_sv_undef)
   struct dsc$descriptor_s AssocName, NodeName;
   struct dsc$descriptor_s *AssocNamePtr, *NodeNamePtr;
   int status;
+  SV *return_sv;
   
   unsigned int ConnHandle;
 
   ios_icc IOS_ICC;
 
+  if (DebugLevel & DEBUG_TRACE) {
+    puts("Entering open_connection");
+  }
+
   /* 'Kay, validate our stuff */
   if (!SvOK(assoc_name)) {
+    if (DebugLevel & DEBUG_TRACE) {
+      puts("Leaving open_connection");
+    }
     croak("association name may not be undef");
   }
     
@@ -351,41 +496,70 @@ open_connection(assoc_name, node = &PL_sv_undef)
   /* blanks appropriately */
   if (!SvOK(assoc_name)) {
     AssocNamePtr = NULL;
+    if (DebugLevel & DEBUG_CHATTY) {
+      printf("Assoc name: NULL\n");
+    }
   } else {
     AssocName.dsc$b_dtype = DSC$K_DTYPE_T;
     AssocName.dsc$b_class = DSC$K_CLASS_S;
     AssocName.dsc$a_pointer = SvPV(assoc_name, PL_na);
     AssocName.dsc$w_length = SvCUR(assoc_name);
     AssocNamePtr = &AssocName;
+    if (DebugLevel & DEBUG_CHATTY) {
+      printf("Assoc name: %s\n", SvPV(assoc_name, PL_na));
+    }
   }
     
   /* If the name's undef, use the default name, otherwise fill in the */
   /* blanks appropriately */
   if (!SvOK(node)) {
     NodeNamePtr = NULL;
+    if (DebugLevel & DEBUG_CHATTY) {
+      printf("Node name: NULL\n");
+    }
   } else {
     NodeName.dsc$b_dtype = DSC$K_DTYPE_T;
     NodeName.dsc$b_class = DSC$K_CLASS_S;
     NodeName.dsc$a_pointer = SvPV(node, PL_na);
     NodeName.dsc$w_length = SvCUR(node);
     NodeNamePtr = &NodeName;
+    if (DebugLevel & DEBUG_CHATTY) {
+      printf("Node name: %s\n", SvPV(node, PL_na));
+    }
   }
 
-  status = sys$icc_connect(&IOS_ICC, NULL, NULL,
-			   ICC$C_DFLT_ASSOC_HANDLE, &ConnHandle,
-			   AssocNamePtr, NodeNamePtr, 0, NULL, 0,
-			   NULL, NULL, NULL, 0);
+  status = sys$icc_connectw(&IOS_ICC, NULL, NULL,
+			    ICC$C_DFLT_ASSOC_HANDLE, &ConnHandle,
+			    AssocNamePtr, NodeNamePtr, 0, NULL, 0,
+			    NULL, NULL, NULL, 0);
+  if (DebugLevel & DEBUG_STATUS) {
+    printf("sys$icc_connect returned %i\n", status);
+  }
   if (SS$_NORMAL == status) {
     /* Hey, look--we got something. Pass it back. This counts on the */
     /* fact that a pointer will fit into the IV slot of an SV. This is */
     /* probably a bad, bad thing I'm doing here... */
-    XPUSHs(sv_2mortal(newSViv(ConnHandle)));
+    return_sv = sv_2mortal(newSViv(ConnHandle));
+    XPUSHs(return_sv);
+    if (DebugLevel & DEBUG_CHATTY) {
+      printf("Connection opened was %i (%i)\n", ConnHandle,
+	     SvIV(return_sv));
+    }
+    if (DebugLevel & DEBUG_TRACE) {
+      puts("Leaving open_connection");
+    }
     XSRETURN(1);
   } else {
     printf("Error %s\n", ss_translate(status));
     SETERRNO(EVMSERR, status);
+    if (DebugLevel & DEBUG_TRACE) {
+      puts("Leaving open_connection");
+    }
     XSRETURN_UNDEF;
+  }
+  if (DebugLevel & DEBUG_TRACE) {
+    puts("Leaving open_connection");
   }
 }
 
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    
